@@ -9,7 +9,6 @@ from google import genai
 from flask import Flask
 
 # ================= CONFIGURAÇÕES DE NUVEM =================
-# As chaves são puxadas do cofre do Render
 QUIVER_TOKEN = os.environ.get("QUIVER_TOKEN")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
@@ -115,7 +114,7 @@ def ajustar_por_voz(message):
     Regras:
     1. Identifique o valor em caixa (dinheiro livre). Se não for falado, use 0.0.
     2. Identifique as ações (traduza o nome da empresa para o Ticker correto da bolsa americana) e seus valores exatos em dólares.
-    3. Responda APENAS com um JSON válido e limpo, sem crases de formatação Markdown.
+    3. Responda APENAS com um JSON válido e limpo.
     
     Exemplo do formato de saída exigido:
     {{"caixa_disponivel": 50.0, "ativos": {{"NVDA": 500.0, "AAPL": 200.0, "MSFT": 100.0}}}}
@@ -124,7 +123,5 @@ def ajustar_por_voz(message):
     try:
         resposta = client.models.generate_content(model='gemini-3.6-flash', contents=prompt).text.strip()
         
-        if resposta.startswith("```json"):
-            resposta = resposta.replace("```json\n", "").replace("\n```", "")
-        if resposta.startswith("```"):
-            resposta = resposta.replace("
+        # Limpeza robusta contra quebras de linha em Markdown
+        resposta = resposta.replace("```json", "").replace("
