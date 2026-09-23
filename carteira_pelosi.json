@@ -1,0 +1,11 @@
+{
+    "caixa_disponivel": 0.0,
+    "total_investido": 1000.0,
+    "ativos": {
+        "NVDA": 400.0,
+        "AAPL": 300.0,
+        "MSFT": 200.0,
+        "AVGO": 100.0
+    },
+    "ultimo_trade_visto": ""
+}
