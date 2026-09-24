@@ -124,4 +124,149 @@ def ajustar_por_voz(message):
         resposta = client.models.generate_content(model='gemini-3.6-flash', contents=prompt).text.strip()
         
         # Limpeza robusta contra quebras de linha em Markdown
-        resposta = resposta.replace("```json", "").replace("
+        resposta = resposta.replace("```json", "").replace("```", "").strip()
+            
+        novos_dados = json.loads(resposta)
+        
+        db = carregar_db()
+        db["caixa_disponivel"] = float(novos_dados.get("caixa_disponivel", 0.0))
+        db["ativos"] = novos_dados.get("ativos", {})
+        db["total_investido"] = sum(db["ativos"].values())
+        salvar_db(db)
+        
+        bot.send_message(message.chat.id, "✅ *Valores atualizados com sucesso!*\nEnvie o comando /analisar para calcularmos a sua defasagem.", parse_mode="Markdown")
+    except Exception as e:
+        bot.send_message(message.chat.id, "❌ *Não consegui extrair os valores com precisão.* Tente escrever de forma mais direta (Ex: /ajustar NVDA 400, AAPL 200, Caixa 100).", parse_mode="Markdown")
+
+@bot.message_handler(commands=['analisar'])
+def analisar_defasagem(message):
+    db = carregar_db()
+    caixa = db.get("caixa_disponivel", 0.0)
+    ativos = db.get("ativos", {})
+    patrimonio = caixa + sum(ativos.values())
+    
+    if patrimonio == 0:
+        bot.send_message(message.chat.id, "Sua carteira está vazia.")
+        return
+        
+    ALVO = {"NVDA": 0.40, "AAPL": 0.30, "MSFT": 0.20, "AVGO": 0.10}
+    
+    texto = f"⚖️ **ANÁLISE DE DEFASAGEM (ALVO PELOSI)**\n"
+    texto += f"💵 Patrimônio Total: US$ {patrimonio:.2f}\n"
+    texto += f"🏦 Caixa Livre: US$ {caixa:.2f}\n\n"
+    
+    sugestoes = []
+    
+    for ticker, percentual in ALVO.items():
+        ideal = patrimonio * percentual
+        atual = ativos.get(ticker, 0.0)
+        diff = ideal - atual
+        
+        texto += f"• **{ticker}** | Atual: US$ {atual:.2f} 🎯 Ideal: US$ {ideal:.2f}\n"
+        
+        if diff > 10:
+            texto += f"   📉 Faltam US$ {diff:.2f}\n"
+            sugestoes.append(f"🟢 COMPRAR US$ {diff:.2f} de {ticker}")
+        elif diff < -10:
+            texto += f"   📈 Excesso de US$ {abs(diff):.2f}\n"
+            sugestoes.append(f"🔴 VENDER US$ {abs(diff):.2f} de {ticker}")
+        else:
+            texto += f"   ✅ Perfeitamente alinhado!\n"
+            
+    texto += "\n**🛠️ PLANO DE REALOCAÇÃO RECOMENDADO:**\n"
+    if sugestoes:
+        texto += "\n".join(sugestoes)
+        if caixa < sum([diff for ticker, diff in ALVO.items() if (patrimonio * diff) - ativos.get(ticker, 0.0) > 10]):
+            texto += "\n\n⚠️ *Aviso: O seu caixa livre não cobre todas as compras necessárias. Comece executando as ordens de VENDA para gerar liquidez antes de comprar o que falta.*"
+    else:
+        texto += "Perfeito! Nenhuma movimentação é necessária hoje."
+        
+    bot.send_message(message.chat.id, texto, parse_mode="Markdown")
+
+def disparar_alerta_interativo(trade, valor_aporte):
+    ticker = trade.get('Ticker', 'Desconhecido')
+    prompt = f"Crie um alerta VERDE curto com emojis informando a compra de {ticker} pela Nancy Pelosi. Valor do aporte recomendado: US$ {valor_aporte}. Use apenas negrito (**)."
+    
+    resposta = client.models.generate_content(model='gemini-3.6-flash', contents=prompt).text.strip()
+    
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("✅ Executado na Avenue", callback_data=f"COMPRAR_{ticker}_{valor_aporte}"))
+    markup.add(InlineKeyboardButton("❌ Ignorado", callback_data="IGNORAR"))
+
+    bot.send_message(CHAT_ID, resposta, reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: True)
+def processar_clique(call):
+    acao = call.data
+    if acao == "IGNORAR":
+        bot.edit_message_text("❌ *Ignorado.* O banco de dados não foi alterado.", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown")
+        return
+
+    if acao.startswith("COMPRAR"):
+        _, ticker, valor_str = acao.split("_")
+        valor_aporte = float(valor_str)
+        db = carregar_db()
+        
+        if db.get("caixa_disponivel", 0.0) < valor_aporte:
+            bot.answer_callback_query(call.id, "Saldo insuficiente no caixa virtual!")
+            return
+            
+        db["caixa_disponivel"] -= valor_aporte
+        if "ativos" not in db:
+            db["ativos"] = {}
+            
+        if ticker in db["ativos"]:
+            db["ativos"][ticker] += valor_aporte
+        else:
+            db["ativos"][ticker] = valor_aporte
+            
+        salvar_db(db)
+        bot.edit_message_text(f"✅ *Compra de US$ {valor_aporte} de {ticker} registrada com sucesso!*", chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown")
+
+def varredura_quiver():
+    url = "https://api.quiverquant.com/beta/live/congresstrading"
+    headers = {"Authorization": f"Token {QUIVER_TOKEN}", "Accept": "application/json"}
+    try:
+        resposta = requests.get(url, headers=headers, timeout=15)
+        if resposta.status_code == 200:
+            for trade in resposta.json():
+                politico = trade.get('Representative', '')
+                ticker = trade.get('Ticker', '')
+                operacao = trade.get('Transaction', '')
+                trade_id = f"{politico}_{ticker}_{trade.get('ReportDate', '')}_{operacao}"
+                
+                if any(vip in politico for vip in POLITICOS_VIP) and operacao == "Purchase":
+                    db = carregar_db()
+                    if db.get("ultimo_trade_visto") != trade_id:
+                        db["ultimo_trade_visto"] = trade_id
+                        salvar_db(db)
+                        disparar_alerta_interativo(trade, 50.0)
+                    return 
+    except Exception as e:
+        print(f"Erro na varredura da Quiver: {e}")
+
+@bot.message_handler(commands=['buscar'])
+def forcar_busca(message):
+    bot.send_message(message.chat.id, "Iniciando varredura manual na Quiver...")
+    varredura_quiver()
+
+def loop_continuo_quiver():
+    while True:
+        varredura_quiver()
+        time.sleep(3600)
+
+def iniciar_telegram():
+    while True:
+        try:
+            bot.polling(none_stop=True, timeout=60)
+        except Exception as e:
+            time.sleep(15)
+
+if TELEGRAM_TOKEN and GEMINI_API_KEY:
+    carregar_db()
+    threading.Thread(target=loop_continuo_quiver, daemon=True).start()
+    threading.Thread(target=iniciar_telegram, daemon=True).start()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
