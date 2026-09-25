@@ -44,6 +44,46 @@ def salvar_db(dados):
     with open(ARQUIVO_DB, "w") as f:
         json.dump(dados, f, indent=4)
 
+# --- SISTEMA DE RESILIÊNCIA PARA A INTELIGÊNCIA ARTIFICIAL ---
+def consultar_gemini_com_retry(prompt, tentativas=3):
+    for i in range(tentativas):
+        try:
+            resposta = client.models.generate_content(model='gemini-3.6-flash', contents=prompt)
+            return resposta.text.strip()
+        except Exception as e:
+            erro_str = str(e)
+            if ("503" in erro_str or "UNAVAILABLE" in erro_str) and i < tentativas - 1:
+                time.sleep(3)
+                continue
+            raise e
+
+# --- FATIAMENTO INTELIGENTE PARA TEXTOS GIGANTES NO TELEGRAM ---
+def enviar_mensagem_longa(chat_id, texto):
+    if len(texto) <= 4000:
+        try:
+            bot.send_message(chat_id, texto, parse_mode="Markdown")
+        except Exception:
+            bot.send_message(chat_id, texto) # Fallback sem markdown caso haja erro de formatação
+        return
+
+    partes = []
+    bloco = ""
+    for linha in texto.split('\n'):
+        if len(bloco) + len(linha) > 4000:
+            partes.append(bloco)
+            bloco = linha + "\n"
+        else:
+            bloco += linha + "\n"
+    if bloco:
+        partes.append(bloco)
+        
+    for parte in partes:
+        if parte.strip():
+            try:
+                bot.send_message(chat_id, parte, parse_mode="Markdown")
+            except Exception:
+                bot.send_message(chat_id, parte)
+
 @bot.message_handler(commands=['start', 'ajuda'])
 def enviar_ajuda(message):
     texto = (
@@ -58,7 +98,7 @@ def enviar_ajuda(message):
         "/setup - Injeta US$ 1000 adicionais no caixa virtual\n"
         "/reset - Zera a carteira para US$ 1000 em caixa"
     )
-    bot.send_message(message.chat.id, texto, parse_mode="Markdown")
+    enviar_mensagem_longa(message.chat.id, texto)
 
 @bot.message_handler(commands=['setup'])
 def injetar_caixa(message):
@@ -96,11 +136,11 @@ def mostrar_resumo(message):
     
     ativos_ordenados = sorted(ativos.items(), key=lambda x: x[1], reverse=True)
     for ticker, valor in ativos_ordenados:
-        if valor > 0.1: # Esconde poeira
+        if valor > 0.1:
             percentual = (valor / patrimonio_total) * 100
             texto += f"• {ticker}: US$ {valor:.2f} ({percentual:.1f}%)\n"
 
-    bot.send_message(message.chat.id, texto, parse_mode="Markdown")
+    enviar_mensagem_longa(message.chat.id, texto)
 
 @bot.message_handler(commands=['ajustar'])
 def ajustar_por_voz(message):
@@ -122,7 +162,7 @@ def ajustar_por_voz(message):
     """
     
     try:
-        resposta = client.models.generate_content(model='gemini-3.6-flash', contents=prompt).text.strip()
+        resposta = consultar_gemini_com_retry(prompt)
         resposta = resposta.replace("```json", "").replace("```", "").strip()
         novos_dados = json.loads(resposta)
         
@@ -134,7 +174,7 @@ def ajustar_por_voz(message):
         
         bot.send_message(message.chat.id, "✅ *Valores atualizados!* Envie /analisar para calcular o rebalanceamento mensal.", parse_mode="Markdown")
     except Exception as e:
-        bot.send_message(message.chat.id, "❌ *Erro ao processar o texto.* Tente um formato direto: /ajustar Caixa 100, NVDA 200.", parse_mode="Markdown")
+        bot.send_message(message.chat.id, "❌ *Erro de processamento da IA ou formato incorreto.* Tente de forma mais direta: /ajustar Caixa 100, NVDA 200.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['perguntar'])
 def responder_pergunta(message):
@@ -149,7 +189,6 @@ def responder_pergunta(message):
     headers = {"Authorization": f"Token {QUIVER_TOKEN}", "Accept": "application/json"}
     try:
         resposta = requests.get(url, headers=headers, timeout=15)
-        # Pega as últimas 150 movimentações para dar contexto rico à IA sem estourar limite
         dados_api = resposta.json()[:150] 
 
         prompt = f"""
@@ -162,10 +201,10 @@ def responder_pergunta(message):
         
         Responda de forma analítica, direta e profissional em português. Use negrito para tickers e valores.
         """
-        resposta_ia = client.models.generate_content(model='gemini-3.6-flash', contents=prompt).text.strip()
-        bot.send_message(message.chat.id, resposta_ia, parse_mode="Markdown")
+        resposta_ia = consultar_gemini_com_retry(prompt)
+        enviar_mensagem_longa(message.chat.id, resposta_ia)
     except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Erro de comunicação com a API: {e}")
+        bot.send_message(message.chat.id, f"❌ Erro de comunicação com os servidores (API ou IA): {e}")
 
 @bot.message_handler(commands=['analisar'])
 def analisar_mensal_top50(message):
@@ -178,7 +217,6 @@ def analisar_mensal_top50(message):
         resposta = requests.get(url, headers=headers, timeout=15)
         trades = resposta.json()
         
-        # 1. Somar o volume financeiro estimado por Ticker (Apenas Compras)
         volumes_compra = {}
         for trade in trades:
             if trade.get('Transaction') == 'Purchase':
@@ -189,18 +227,15 @@ def analisar_mensal_top50(message):
                 valor_piso = 0
                 if "$" in amount_str:
                     try:
-                        # Pega o piso da faixa (Ex: $15,001 - $50,000 -> 15001)
                         parte_limpa = amount_str.split('-')[0].replace('$', '').replace(',', '').strip()
                         if parte_limpa.lower() != 'unknown':
                             valor_piso = float(parte_limpa)
                     except:
                         valor_piso = 0
                 
-                # Se o valor não estiver na faixa, estimamos $10k como piso padrão para não descartar
                 if valor_piso == 0: valor_piso = 10000 
                 volumes_compra[ticker] = volumes_compra.get(ticker, 0) + valor_piso
         
-        # 2. Isolar as TOP 50 maiores ações de convicção
         top50 = sorted(volumes_compra.items(), key=lambda x: x[1], reverse=True)[:50]
         volume_total_top50 = sum([v for k, v in top50])
         
@@ -208,10 +243,8 @@ def analisar_mensal_top50(message):
             bot.send_message(message.chat.id, "Nenhuma compra registrada recentemente.")
             return
 
-        # 3. Criar a "fatia ideal" de cada ação baseada no peso do dinheiro
         alvo_percentual = {ticker: (volume / volume_total_top50) for ticker, volume in top50}
         
-        # 4. Avaliar contra a carteira do usuário
         db = carregar_db()
         caixa = db.get("caixa_disponivel", 0.0)
         ativos_atuais = db.get("ativos", {})
@@ -225,19 +258,16 @@ def analisar_mensal_top50(message):
         ordens_venda = []
         ordens_compra = []
         
-        # Verificar o que precisa comprar (dentro das Top 50)
         for ticker, percentual in alvo_percentual.items():
             ideal = patrimonio * percentual
             atual = ativos_atuais.get(ticker, 0.0)
             diff = ideal - atual
             
-            # Só sugere se a diferença for maior que 10 dólares (evita poeira)
             if diff > 10:
                 ordens_compra.append(f"🟢 COMPRAR US$ {diff:.2f} de **{ticker}**")
             elif diff < -10:
                 ordens_venda.append(f"🔴 VENDER US$ {abs(diff):.2f} de **{ticker}**")
 
-        # Limpar o que não faz mais parte do Top 50
         for ticker, atual in ativos_atuais.items():
             if ticker not in alvo_percentual and atual > 10:
                 ordens_venda.append(f"🔴 LIQUIDAR TODO O ATIVO: US$ {atual:.2f} de **{ticker}** (Saiu do Top 50)")
@@ -246,27 +276,21 @@ def analisar_mensal_top50(message):
             bot.send_message(message.chat.id, "✅ Sua carteira está perfeitamente alinhada com o TOP 50 do Congresso!")
             return
 
-        # Montar a mensagem de saída limpa
         texto_ordens += "*ORDENS DE VENDA (Geração de Caixa)*\n"
         texto_ordens += "\n".join(ordens_venda) if ordens_venda else "Nenhuma venda necessária."
         texto_ordens += "\n\n*ORDENS DE COMPRA (Alocação)*\n"
         
-        # Limitamos a exibição das compras às maiores diferenças para caber na tela do celular
         if ordens_compra:
-            texto_ordens += "\n".join(ordens_compra[:20]) 
-            if len(ordens_compra) > 20:
-                texto_ordens += f"\n... e outras {len(ordens_compra)-20} micro-posições. (Foque nas principais acima)."
+            texto_ordens += "\n".join(ordens_compra) 
         else:
             texto_ordens += "Nenhuma compra necessária."
 
-        bot.send_message(message.chat.id, texto_ordens, parse_mode="Markdown")
+        enviar_mensagem_longa(message.chat.id, texto_ordens)
 
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Erro ao calcular rebalanceamento: {e}")
 
 def varredura_quiver_baleias():
-    # Esta função roda em silêncio de hora em hora. Ela NÃO pede pra você comprar,
-    # serve apenas como um "Alerta de Tubarão" (Compras acima de US$ 250.000)
     url = "https://api.quiverquant.com/beta/live/congresstrading"
     headers = {"Authorization": f"Token {QUIVER_TOKEN}", "Accept": "application/json"}
     try:
@@ -286,7 +310,6 @@ def varredura_quiver_baleias():
                             valor_piso = float(amount_str.split('-')[0].replace('$', '').replace(',', '').strip())
                         except: pass
                     
-                    # Alerta situacional massivo (Membro do congresso injetou > 250k dólares)
                     if valor_piso >= 250000:
                         db = carregar_db()
                         if db.get("ultimo_trade_visto") != trade_id:
